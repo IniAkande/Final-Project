@@ -1,0 +1,265 @@
+import pandas as pd
+import numpy as np
+import pickle
+from collections import Counter, defaultdict
+import re
+
+# import sklearn models
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import TfidfTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.naive_bayes import MultinomialNB
+from skmultilearn.problem_transform import LabelPowerset
+
+# nlp libraries/api
+import en_core_web_lg
+from spacy import displacy
+import gensim
+from neuralcoref import Coref
+
+spacy = en_core_web_lg.load()
+coref = Coref(nlp=spacy)
+
+neg_file = open("neg_words.txt",encoding = "ISO-8859-1")
+pos_file = open("pos_words.txt",encoding = "ISO-8859-1")
+neg = [line.strip() for line in neg_file.readlines()]
+pos = [line.strip() for line in pos_file.readlines()]
+opinion_words = neg + pos
+
+# Uncomment below if running for first time. 
+# Setup nltk corpora path and Google Word2Vec location
+# google_vec_file = 'GoogleNews-vectors-negative300.bin'
+# word2vec = gensim.models.KeyedVectors.load_word2vec_format(google_vec_file, binary=True)
+# pickle.dump(word2vec, open("word2vec_google.pkl", 'wb'))
+
+# If above script has been run, load saved word embedding
+word2vec = pickle.load(open("word2vec_google.pkl", 'rb'))
+
+# load the Multi-label binarizer from previous notebook
+mlb = pickle.load(open("mlb.pkl", 'rb'))
+
+# load the fitted naive bayes model from previous notebook
+naive_model1 = pickle.load(open("naive_model1.pkl", 'rb'))
+
+def check_similarity(aspects, word):
+    '''
+    checks for word2vec similarity values between category word and the term
+    returns most similar word
+    '''
+    similarity = []
+    for aspect in aspects:
+        similarity.append(word2vec.n_similarity([aspect], [word]))
+    # set threshold for max value
+    if max(similarity) > 0.30:
+        return aspects[np.argmax(similarity)]
+    else:
+        return None
+
+def assign_term_to_aspect(aspect_sent, terms_dict, sent_dict, pred):
+    '''
+    function: takes in a sentiment dictionary and appends the aspect dictionary
+    inputs: sent_dict is a Counter in the form Counter(term:sentiment value)
+            aspect_sent is total sentiment tally
+            terms_dict is dict with individual aspect words associated with sentiment
+    output: return two types of aspect dictionaries: 
+            updated terms_dict and aspect_sent
+    '''
+    aspects = ['ambience', 'food', 'price', 'service']
+    
+    
+    
+    # First, check word2vec
+    # Note: the .split() is used for the term because word2vec can't pass compound nouns
+    for term in sent_dict:
+        try:
+            # The conditions for when to use the NB classifier as default vs word2vec
+            if check_similarity(aspects, term.split()[-1]):
+                terms_dict[check_similarity(aspects, term.split()[-1])][term] += sent_dict[term]
+                if sent_dict[term] > 0:
+                    aspect_sent[check_similarity(aspects, term.split()[-1])]["pos"] += sent_dict[term]
+                else:
+                    aspect_sent[check_similarity(aspects, term.split()[-1])]["neg"] += abs(sent_dict[term])
+            elif (pred[0] == "anecdotes/miscellaneous"):
+                continue
+            elif (len(pred) == 1):
+                terms_dict[pred[0]][term] += sent_dict[term]
+                if sent_dict[term] > 0:
+                    aspect_sent[pred[0]]["pos"] += sent_dict[term]
+                else:
+                    aspect_sent[pred[0]]["neg"] += abs(sent_dict[term])
+            # if unable to classify via NB or word2vec, then put them in misc. bucket
+            else:
+                terms_dict["misc"][term] += sent_dict[term]
+                if sent_dict[term] > 0:
+                    aspect_sent["misc"]["pos"] += sent_dict[term]
+                else:
+                    aspect_sent["misc"]["neg"] += abs(sent_dict[term])
+        except:
+            print(term, "not in vocab")
+            continue
+    return aspect_sent, terms_dict
+    
+    
+def feature_sentiment(sentence):
+    '''
+    input: dictionary and sentence
+    function: appends dictionary with new features if the feature did not exist previously,
+              then updates sentiment to each of the new or existing features
+    output: updated dictionary
+    '''
+
+    sent_dict = Counter()
+    sentence = spacy(sentence)
+    debug = 0
+    for token in sentence:
+    #    print(token.text,token.dep_, token.head, token.head.dep_)
+        # check if the word is an opinion word, then assign sentiment
+        if token.text in opinion_words:
+            sentiment = 1 if token.text in pos else -1
+            # if target is an adverb modifier (i.e. pretty, highly, etc.)
+            # but happens to be an opinion word, ignore and pass
+            if (token.dep_ == "advmod"):
+                continue
+            elif (token.dep_ == "amod"):
+                sent_dict[token.head.text] += sentiment
+            # for opinion words that are adjectives, adverbs, verbs...
+            else:
+                for child in token.children:
+                    # if there's a adj modifier (i.e. very, pretty, etc.) add more weight to sentiment
+                    # This could be better updated for modifiers that either positively or negatively emphasize
+                    if ((child.dep_ == "amod") or (child.dep_ == "advmod")) and (child.text in opinion_words):
+                        sentiment *= 1.5
+                    # check for negation words and flip the sign of sentiment
+                    if child.dep_ == "neg":
+                        sentiment *= -1
+                for child in token.children:
+                    # if verb, check if there's a direct object
+                    if (token.pos_ == "VERB") & (child.dep_ == "dobj"):                        
+                        sent_dict[child.text] += sentiment
+                        # check for conjugates (a AND b), then add both to dictionary
+                        subchildren = []
+                        conj = 0
+                        for subchild in child.children:
+                            if subchild.text == "and":
+                                conj=1
+                            if (conj == 1) and (subchild.text != "and"):
+                                subchildren.append(subchild.text)
+                                conj = 0
+                        for subchild in subchildren:
+                            sent_dict[subchild] += sentiment
+
+                # check for negation
+                for child in token.head.children:
+                    noun = ""
+                    if ((child.dep_ == "amod") or (child.dep_ == "advmod")) and (child.text in opinion_words):
+                        sentiment *= 1.5
+                    # check for negation words and flip the sign of sentiment
+                    if (child.dep_ == "neg"): 
+                        sentiment *= -1
+                
+                # check for nouns
+                for child in token.head.children:
+                    noun = ""
+                    if (child.pos_ == "NOUN") and (child.text not in sent_dict):
+                        noun = child.text
+                        # Check for compound nouns
+                        for subchild in child.children:
+                            if subchild.dep_ == "compound":
+                                noun = subchild.text + " " + noun
+                        sent_dict[noun] += sentiment
+                    debug += 1
+    return sent_dict
+
+def classify_and_sent(sentence, aspect_sent, terms_dict):
+    '''
+    function: classify the sentence into a category, and assign sentiment
+    note: aspect_dict is a parent dictionary with all the aspects
+    input: sentence & aspect dictionary, which is going to be updated
+    output: updated aspect dictionary
+    '''
+    # classify sentence with NB classifier
+    predicted = naive_model1.predict([sentence])
+    pred = mlb.inverse_transform(predicted)
+    
+    # get aspect names and their sentiment in a dictionary form
+    sent_dict = feature_sentiment(sentence)
+    
+    # try to categorize the aspect names into the 4 aspects in aspect_dict
+    aspect_sent, terms_dict = assign_term_to_aspect(aspect_sent, terms_dict, sent_dict, pred[0])
+    return aspect_sent, terms_dict
+
+def replace_pronouns(text):
+    coref.one_shot_coref(text)
+    return coref.get_resolved_utterances()[0]
+
+def split_sentence(text):
+    '''
+    splits review into a list of sentences using spacy's sentence parser
+    '''
+    review = spacy(text)
+    bag_sentence = []
+    start = 0
+    for token in review:
+        if token.sent_start:
+            bag_sentence.append(review[start:(token.i-1)])
+            start = token.i
+        if token.i == len(review)-1:
+            bag_sentence.append(review[start:(token.i+1)])
+    return bag_sentence
+
+# Remove special characters using regex
+def remove_special_char(sentence):
+    return re.sub(r"[^a-zA-Z0-9.',:;?]+", ' ', sentence)
+
+def review_pipe(review, aspect_sent, terms_dict={'ambience':Counter(), 'food':Counter(), 'price':Counter(), 'service':Counter(),'misc':Counter()}):
+    review = replace_pronouns(review)
+    sentences = split_sentence(review)
+    for sentence in sentences:
+        sentence = remove_special_char(str(sentence))
+        aspect_sent, terms_dict = classify_and_sent(sentence.lower(), aspect_sent, terms_dict)
+    return aspect_sent, terms_dict
+    
+    
+    #PIPELINE
+    for key in a:
+    if a[key]:
+        print(str(key), ":", a[key])
+        
+    pitt = pd.read_pickle("yelp_pitt.pkl")
+pitt = pitt.drop(["neighborhood","address","city","state",
+                        "postal_code","latitude","longitude"],1)
+meat_potatoes = pitt[pitt.name=='"Meat & Potatoes"']
+
+
+
+# There are two restaurants named primanti on yelp.  
+# The resturant used has that has 1600 reviews.
+primanti = pitt[(pitt.name == '"Primanti Bros."') & (pitt.review_count == 1101)]
+
+pitt[(pitt.name!='"Meat & Potatoes"') & (pitt.categories.str.contains(";American"))].sort_values("review_count",ascending=False)
+pitt.head()
+
+# final output aspect sentiment, which is the overall sentiment scores
+aspect_sent
+
+# final output all the aspect terms
+primanti_terms
+
+
+# pickle the aspect terms and sentiment separately.
+# Modify this code for the restaurant of interest.
+pickle.dump(aspect_sent, open("primanti_sentiment.pkl", 'wb'))
+pickle.dump(terms_dict, open("primanti_dict.pkl", 'wb'))
+
+primanti_sent = pickle.load(open("primanti_sentiment.pkl", 'rb'))
+primanti_terms = pickle.load(open("primanti_dict.pkl", 'rb'))
+meat_potatoes_sent = pickle.load(open("meat_potatoes_sentiment.pkl", 'rb'))
+meat_potatoes_terms = pickle.load(open("meat_potatoes_dict.pkl", 'rb'))
+
+import matplotlib.pyplot as plt
+
+# quick visualization
+pd.DataFrame(meat_potatoes_sent).T.plot(kind='bar')
+plt.show()
